@@ -123,6 +123,82 @@ defmodule Hermes.Server.Base do
 
   @impl GenServer
   def handle_call({:request, decoded, session_id, context}, from, state) when is_map(decoded) do
+    if session_known?(decoded, session_id, context, state) do
+      attach_and_dispatch(decoded, session_id, context, from, state)
+    else
+      # Client supplied an Mcp-Session-Id with no live session anywhere
+      # (resumed/restarted/never-initialized) and this is not an
+      # initialize-lifecycle message. Per the MCP Streamable HTTP spec
+      # this MUST be answered with transport-level HTTP 404 so the client
+      # re-`initialize`s — NOT silently vivified into a fresh,
+      # uninitialized session that then deadlocks the defer/init-wait
+      # path and surfaces an unactionable JSON-RPC error inside HTTP 2xx.
+      # Expected on resume, so :info (not a fault).
+      Logging.server_event(
+        "session_not_found",
+        %{session_id: session_id, method: decoded["method"]},
+        level: :info
+      )
+
+      {:reply, {:error, :session_not_found}, state}
+    end
+  end
+
+  def handle_call(request, from, %{module: module} = state) do
+    case module.handle_call(request, from, state.frame) do
+      {:reply, reply, frame} ->
+        {:reply, reply, %{state | frame: frame}}
+
+      {:reply, reply, frame, cont} ->
+        {:reply, reply, %{state | frame: frame}, cont}
+
+      {:noreply, frame} ->
+        {:noreply, %{state | frame: frame}}
+
+      {:noreply, frame, cont} ->
+        {:noreply, %{state | frame: frame}, cont}
+
+      {:stop, reason, reply, frame} ->
+        {:stop, reason, reply, %{state | frame: frame}}
+
+      {:stop, reason, frame} ->
+        {:stop, reason, %{state | frame: frame}}
+    end
+  end
+
+  # An initialize-lifecycle request always proceeds (the fresh handshake
+  # legitimately creates the session). Otherwise the session must already
+  # exist — either locally cached on this node OR live somewhere in the
+  # (possibly clustered) registry. The registry probe MUST be the
+  # cluster-aware one (`SessionSupervisor.whereis_session/3` →
+  # `registry.whereis_server_session/2`, the same resolution
+  # `create_session`/`close_session` use, minus the side effect) so a
+  # session living on another node is never falsely 404'd into a
+  # cross-node reconnect storm.
+  #
+  # `session_id` is always a binary for `{:request, …}` in practice
+  # (Streamable-HTTP requests are gated by `determine_session_id` in the
+  # plug; SSE/stdio supply a binary). The explicit `is_binary/1` here is
+  # a defensive invariant guard so a non-binary id degrades to "unknown"
+  # (→ 404) rather than raising in `whereis_session/3`'s own guard.
+  defp session_known?(decoded, session_id, context, %{sessions: sessions, registry: registry, module: module}) do
+    Message.is_initialize_lifecycle(decoded) or
+      not streamable_http?(context) or
+      is_map_key(sessions, session_id) or
+      (is_binary(session_id) and
+         match?({:ok, _pid}, SessionSupervisor.whereis_session(registry, module, session_id)))
+  end
+
+  # The ENA-9175 unknown-session → 404 contract is the MCP Streamable
+  # HTTP (2025-03-26) spec. Only that transport tags the request context.
+  # For the deprecated HTTP+SSE transport, stdio, or any other caller
+  # (no/blank context) this returns false so `session_known?` stays
+  # `true` — i.e. the pre-ENA-9175 attach/create behavior is preserved
+  # for non-Streamable-HTTP paths (no regression of the old transport).
+  defp streamable_http?(context) when is_map(context), do: Map.get(context, :transport) == :streamable_http
+  defp streamable_http?(_), do: false
+
+  defp attach_and_dispatch(decoded, session_id, context, from, state) do
     case maybe_attach_session(session_id, context, state) do
       {:ok, {%Session{} = session, state}} ->
         if should_defer_for_init?(decoded, session, state) do
@@ -148,28 +224,6 @@ defmodule Hermes.Server.Base do
         error_response = Error.build_json_rpc(error, decoded["id"])
         encoded = Message.encode_error(%{"error" => error_response["error"]}, decoded["id"])
         {:reply, encoded, state}
-    end
-  end
-
-  def handle_call(request, from, %{module: module} = state) do
-    case module.handle_call(request, from, state.frame) do
-      {:reply, reply, frame} ->
-        {:reply, reply, %{state | frame: frame}}
-
-      {:reply, reply, frame, cont} ->
-        {:reply, reply, %{state | frame: frame}, cont}
-
-      {:noreply, frame} ->
-        {:noreply, %{state | frame: frame}}
-
-      {:noreply, frame, cont} ->
-        {:noreply, %{state | frame: frame}, cont}
-
-      {:stop, reason, reply, frame} ->
-        {:stop, reason, reply, %{state | frame: frame}}
-
-      {:stop, reason, frame} ->
-        {:stop, reason, %{state | frame: frame}}
     end
   end
 
