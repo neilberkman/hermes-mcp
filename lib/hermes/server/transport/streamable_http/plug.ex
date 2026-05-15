@@ -120,34 +120,37 @@ if Code.ensure_loaded?(Plug) do
     defp handle_post(conn, %{transport: transport, session_header: session_header} = opts) do
       with :ok <- validate_accept_header(conn),
            {:ok, body, conn} <- maybe_read_request_body(conn, opts),
-           {:ok, [message]} <- maybe_parse_messages(body),
-           {:ok, session_id} <- determine_session_id(conn, session_header, message) do
-        context = build_request_context(conn)
+           {:ok, [message]} <- maybe_parse_messages(body) do
+        case determine_session_id(conn, session_header, message) do
+          {:ok, session_id} ->
+            context = build_request_context(conn)
 
-        Logging.transport_event("parsed_messages", %{
-          message: message,
-          session_id: session_id
-        })
+            Logging.transport_event("parsed_messages", %{
+              message: message,
+              session_id: session_id
+            })
 
-        process_message(message, conn, transport, session_id, context, session_header)
+            process_message(message, conn, transport, session_id, context, session_header)
+
+          {:error, :missing_session_header} ->
+            # Non-initialize request with no Mcp-Session-Id. Per the MCP
+            # Streamable HTTP spec a server that requires a session id
+            # SHOULD answer such a request with HTTP 400 (not fabricate an
+            # id, which masked the missing-session contract). The request is
+            # otherwise valid JSON-RPC, so preserve its id.
+            send_jsonrpc_error(
+              conn,
+              Error.protocol(:invalid_request, %{message: "Mcp-Session-Id header required"}),
+              extract_request_id(message),
+              400
+            )
+        end
       else
         {:error, :invalid_accept_header} ->
           send_error(
             conn,
             406,
             "Not Acceptable: Client must accept both application/json and text/event-stream"
-          )
-
-        {:error, :missing_session_header} ->
-          # Non-initialize request with no Mcp-Session-Id. Per the MCP
-          # Streamable HTTP spec a server that requires a session id
-          # SHOULD answer such a request with HTTP 400 (not fabricate an
-          # id, which masked the missing-session contract).
-          send_jsonrpc_error(
-            conn,
-            Error.protocol(:invalid_request, %{message: "Mcp-Session-Id header required"}),
-            nil,
-            400
           )
 
         {:error, :invalid_json} ->

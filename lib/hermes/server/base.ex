@@ -169,8 +169,10 @@ defmodule Hermes.Server.Base do
   # An initialize-lifecycle request always proceeds (the fresh handshake
   # legitimately creates the session). Otherwise the session must already
   # exist — either locally cached on this node OR live somewhere in the
-  # (possibly clustered) registry. The registry probe MUST be the
-  # cluster-aware one (`SessionSupervisor.whereis_session/3` →
+  # (possibly clustered) registry. Cached local entries still get a
+  # liveness check during attach; a dead cached pid must not silently
+  # vivify a replacement session for Streamable HTTP. The registry probe
+  # MUST be the cluster-aware one (`SessionSupervisor.whereis_session/3` →
   # `registry.whereis_server_session/2`, the same resolution
   # `create_session`/`close_session` use, minus the side effect) so a
   # session living on another node is never falsely 404'd into a
@@ -198,14 +200,29 @@ defmodule Hermes.Server.Base do
   defp streamable_http?(context) when is_map(context), do: Map.get(context, :transport) == :streamable_http
   defp streamable_http?(_), do: false
 
+  defp allow_session_create?(decoded, context) do
+    Message.is_initialize_lifecycle(decoded) or not streamable_http?(context)
+  end
+
   defp attach_and_dispatch(decoded, session_id, context, from, state) do
-    case maybe_attach_session(session_id, context, state) do
+    allow_create? = allow_session_create?(decoded, context)
+
+    case maybe_attach_session(session_id, context, state, allow_create?) do
       {:ok, {%Session{} = session, state}} ->
         if should_defer_for_init?(decoded, session, state) do
           defer_request_until_initialized(from, decoded, session_id, context, @init_wait_total_ms, state)
         else
           handle_request_and_reply(decoded, session, state)
         end
+
+      {:error, reason, state} when reason in [:session_not_found, :session_terminated] and not allow_create? ->
+        Logging.server_event(
+          "session_not_found",
+          %{session_id: session_id, method: decoded["method"], reason: reason},
+          level: :info
+        )
+
+        {:reply, {:error, :session_not_found}, state}
 
       {:error, reason, state} ->
         # Either the session died between create_session/whereis and the
@@ -806,7 +823,10 @@ defmodule Hermes.Server.Base do
 
   @spec maybe_attach_session(session_id :: String.t(), map, t) ::
           {:ok, {session :: Session.t(), t}} | {:error, reason :: term(), t}
-  defp maybe_attach_session(session_id, context, %{sessions: sessions} = state) when is_map_key(sessions, session_id) do
+  defp maybe_attach_session(session_id, context, state), do: maybe_attach_session(session_id, context, state, true)
+
+  defp maybe_attach_session(session_id, context, %{sessions: sessions} = state, allow_create?)
+       when is_map_key(sessions, session_id) do
     {_session_name, pid, ref} = sessions[session_id]
 
     case safe_session_get(pid) do
@@ -822,17 +842,26 @@ defmodule Hermes.Server.Base do
         Process.demonitor(ref, [:flush])
         sessions = Map.delete(sessions, session_id)
         state = cancel_session_expiry(session_id, %{state | sessions: sessions})
-        maybe_attach_session(session_id, context, state)
+        maybe_attach_session(session_id, context, state, allow_create?)
     end
   end
 
-  defp maybe_attach_session(session_id, context, %{sessions: _sessions, registry: registry} = state) do
+  defp maybe_attach_session(session_id, context, %{sessions: _sessions, registry: registry} = state, true) do
     session_name = registry.server_session(state.module, session_id)
 
     case SessionSupervisor.create_session(registry, state.module, session_id) do
       {:ok, pid} -> attach(pid, session_id, session_name, context, state)
       {:error, {:already_started, pid}} -> attach(pid, session_id, session_name, context, state)
       {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp maybe_attach_session(session_id, context, %{sessions: _sessions, registry: registry} = state, false) do
+    session_name = registry.server_session(state.module, session_id)
+
+    case SessionSupervisor.whereis_session(registry, state.module, session_id) do
+      {:ok, pid} -> attach(pid, session_id, session_name, context, state)
+      :not_found -> {:error, :session_not_found, state}
     end
   end
 

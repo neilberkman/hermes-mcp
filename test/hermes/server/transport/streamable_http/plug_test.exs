@@ -182,6 +182,7 @@ defmodule Hermes.Server.Transport.StreamableHTTP.PlugTest do
 
       assert conn.status == 400
       {:ok, response} = Jason.decode(conn.resp_body)
+      assert response["id"] == 1
       assert response["error"]["message"] =~ "Invalid"
     end
 

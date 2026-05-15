@@ -5,6 +5,7 @@ defmodule Hermes.Server.BaseTest do
   alias Hermes.Server.Base
   alias Hermes.Server.Frame
   alias Hermes.Server.Session
+  alias Hermes.Server.Session.Supervisor, as: SessionSupervisor
 
   require Message
 
@@ -205,6 +206,24 @@ defmodule Hermes.Server.BaseTest do
       assert Process.alive?(server)
     end
 
+    test "a stale cached Streamable HTTP session is not recreated before DOWN cleanup", %{server: server} do
+      session_id = "stale_cached_#{System.unique_integer([:positive])}"
+      dead_pid = make_dead_pid()
+
+      :sys.replace_state(server, fn state ->
+        %{state | sessions: Map.put(state.sessions, session_id, {nil, dead_pid, make_ref()})}
+      end)
+
+      request = build_request("tools/list", %{}, 100)
+
+      assert {:error, :session_not_found} =
+               GenServer.call(server, {:request, request, session_id, %{transport: :streamable_http}}, 2_000)
+
+      refute Map.has_key?(:sys.get_state(server).sessions, session_id)
+      assert :not_found == SessionSupervisor.whereis_session(Hermes.Server.Registry, StubServer, session_id)
+      assert Process.alive?(server)
+    end
+
     # Same race on the notification cast path. The cast must drop quietly
     # (no crash, no reply — notifications have no response).
     test "drops notification without crashing if session pid is dead", %{server: server} do
@@ -288,7 +307,7 @@ defmodule Hermes.Server.BaseTest do
     setup do
       start_supervised!(Hermes.Server.Registry)
 
-      start_supervised!({Session.Supervisor, server: StubServer, registry: Hermes.Server.Registry})
+      start_supervised!({SessionSupervisor, server: StubServer, registry: Hermes.Server.Registry})
 
       :ok
     end
