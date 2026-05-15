@@ -166,11 +166,11 @@ defmodule Hermes.Server.Base do
     end
   end
 
-  # An initialize-lifecycle request always proceeds (the fresh handshake
+  # An initialize request always proceeds (the fresh handshake
   # legitimately creates the session). Otherwise the session must already
   # exist — either locally cached on this node OR live somewhere in the
-  # (possibly clustered) registry. Cached local entries still get a
-  # liveness check during attach; a dead cached pid must not silently
+  # (possibly clustered) registry. The existing cached path performs the
+  # liveness check; this gate makes sure a dead cached pid does not then
   # vivify a replacement session for Streamable HTTP. The registry probe
   # MUST be the cluster-aware one (`SessionSupervisor.whereis_session/3` →
   # `registry.whereis_server_session/2`, the same resolution
@@ -184,7 +184,7 @@ defmodule Hermes.Server.Base do
   # a defensive invariant guard so a non-binary id degrades to "unknown"
   # (→ 404) rather than raising in `whereis_session/3`'s own guard.
   defp session_known?(decoded, session_id, context, %{sessions: sessions, registry: registry, module: module}) do
-    Message.is_initialize_lifecycle(decoded) or
+    Message.is_initialize(decoded) or
       not streamable_http?(context) or
       is_map_key(sessions, session_id) or
       (is_binary(session_id) and
@@ -201,7 +201,7 @@ defmodule Hermes.Server.Base do
   defp streamable_http?(_), do: false
 
   defp allow_session_create?(decoded, context) do
-    Message.is_initialize_lifecycle(decoded) or not streamable_http?(context)
+    Message.is_initialize(decoded) or not streamable_http?(context)
   end
 
   defp attach_and_dispatch(decoded, session_id, context, from, state) do

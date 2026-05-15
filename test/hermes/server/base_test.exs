@@ -224,6 +224,40 @@ defmodule Hermes.Server.BaseTest do
       assert Process.alive?(server)
     end
 
+    test "a live registry-resolvable Streamable HTTP session attaches without local cache", %{server: server} do
+      session_id = "registry_live_#{System.unique_integer([:positive])}"
+
+      init_request =
+        "initialize"
+        |> build_request("init_registry_live")
+        |> Map.put("params", %{
+          "protocolVersion" => "2025-03-26",
+          "clientInfo" => %{"name" => "TestClient", "version" => "1.0.0"},
+          "capabilities" => %{}
+        })
+
+      ctx = %{transport: :streamable_http}
+      assert {:ok, _} = GenServer.call(server, {:request, init_request, session_id, ctx})
+      notification = build_notification("notifications/initialized", %{})
+      assert :ok = GenServer.cast(server, {:notification, notification, session_id, %{}})
+      Process.sleep(50)
+
+      {_, pid, ref} = :sys.get_state(server).sessions[session_id]
+
+      :sys.replace_state(server, fn state ->
+        Process.demonitor(ref, [:flush])
+        %{state | sessions: Map.delete(state.sessions, session_id)}
+      end)
+
+      request = build_request("tools/list", %{}, 101)
+
+      assert {:ok, encoded} =
+               GenServer.call(server, {:request, request, session_id, ctx}, 2_000)
+
+      assert encoded =~ ~s("tools")
+      assert {_, ^pid, _} = :sys.get_state(server).sessions[session_id]
+    end
+
     # Same race on the notification cast path. The cast must drop quietly
     # (no crash, no reply — notifications have no response).
     test "drops notification without crashing if session pid is dead", %{server: server} do

@@ -147,6 +147,9 @@ defmodule Hermes.Server.Transport.StreamableHTTP.PlugTest do
     end
 
     test "POST request with notification returns 202", %{opts: opts} do
+      # Notifications have no JSON-RPC response id to preserve. With no
+      # session header, Streamable HTTP keeps the prior best-effort behavior
+      # and accepts the notification instead of fabricating an error response.
       notification =
         build_notification("notifications/message", %{
           "level" => "info",
